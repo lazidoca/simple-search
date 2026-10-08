@@ -1,0 +1,24 @@
+[package]
+name = "fv-search"
+version = "0.1.0"
+edition = "2021"
+description = "Cross-platform high-performance file content search GUI (Rust port of find.py)"
+
+[dependencies]
+eframe = { version = "0.32", features = ["default"] }
+egui = "0.32"
+rfd = "0.15"
+ignore = "0.4"
+rayon = "1.10"
+crossbeam-channel = "0.5"
+open = "5.3"
+chrono = { version = "0.4", features = ["clock"] }
+dirs = "5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+codegen-units = 1

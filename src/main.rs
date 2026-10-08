@@ -1,0 +1,1144 @@
+use chrono::{DateTime, Local};
+use crossbeam_channel::{Receiver, Sender, unbounded};
+use serde::{Deserialize, Serialize};
+use ignore::WalkBuilder;
+use rayon::prelude::*;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
+use std::time::{Instant, UNIX_EPOCH};
+
+// Preset extensions shown as checkboxes (common files).
+const PRESET_EXTS: &[&str] = &[
+    "py", "js", "ts", "tsx", "jsx", "rs", "go", "java", "c", "h", "cpp", "cs", "html", "css",
+    "json", "md", "txt", "xml", "csv", "log", "toml", "yaml", "yml", "sql",
+];
+
+const ACCENT: egui::Color32 = egui::Color32::from_rgb(59, 130, 246);
+const GREEN: egui::Color32 = egui::Color32::from_rgb(34, 197, 94);
+const RED: egui::Color32 = egui::Color32::from_rgb(248, 113, 113);
+
+#[derive(Clone, Debug)]
+struct SearchHit {
+    path: String,
+    modified_unix: i64,
+    size: u64,
+    matches: usize,
+    preview: String,
+}
+
+enum Msg {
+    Hit(SearchHit),
+    Done { elapsed_ms: u64 },
+    Error(String),
+}
+
+#[derive(Clone, Debug)]
+struct SearchParams {
+    root: PathBuf,
+    query: String,
+    query_lower: String,
+    recursive: bool,
+    case_sensitive: bool,
+    exts: HashSet<String>, // lowercase, no dot. Empty = match all.
+    exclude_dirs: Vec<String>,
+    exclude_file_substr: Vec<String>,
+    max_bytes: u64,
+    use_gitignore: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+enum SortBy {
+    Modified,
+    Path,
+    Size,
+}
+
+impl Default for SortBy {
+    fn default() -> Self {
+        SortBy::Modified
+    }
+}
+
+/// Persisted UI state: last folder, last search term, filters.
+/// Stored at OS config dir, e.g. %APPDATA%/fv-search/prefs.json (Windows).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct Prefs {
+    root: String,
+    query: String,
+    recursive: bool,
+    case_sensitive: bool,
+    ext_on: Vec<String>,
+    custom_exts: String,
+    exclude_dirs: String,
+    exclude_file_substr: String,
+    max_mb: String,
+    use_gitignore: bool,
+    sort_by: SortBy,
+}
+
+fn prefs_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("fv-search").join("prefs.json"))
+}
+
+fn load_prefs() -> Prefs {
+    if let Some(p) = prefs_path() {
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            if let Ok(pr) = serde_json::from_str::<Prefs>(&s) {
+                return pr;
+            }
+        }
+    }
+    Prefs::default()
+}
+
+fn save_prefs(app: &SearchApp) {
+    let Some(path) = prefs_path() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let pr = Prefs {
+        root: app.root.clone(),
+        query: app.query.clone(),
+        recursive: app.recursive,
+        case_sensitive: app.case_sensitive,
+        ext_on: app
+            .ext_checks
+            .iter()
+            .filter(|(_, on)| *on)
+            .map(|(e, _)| e.clone())
+            .collect(),
+        custom_exts: app.custom_exts.clone(),
+        exclude_dirs: app.exclude_dirs.clone(),
+        exclude_file_substr: app.exclude_file_substr.clone(),
+        max_mb: app.max_mb.clone(),
+        use_gitignore: app.use_gitignore,
+        sort_by: app.sort_by,
+    };
+    if let Ok(s) = serde_json::to_string_pretty(&pr) {
+        let _ = std::fs::write(&path, s);
+    }
+}
+
+fn main() -> eframe::Result<()> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1120.0, 740.0])
+            .with_min_inner_size([880.0, 600.0]),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "fv-search — fast cross-platform file search",
+        options,
+        Box::new(|cc| Ok(Box::new(SearchApp::new(cc)))),
+    )
+}
+
+struct SearchApp {
+    root: String,
+    query: String,
+    recursive: bool,
+    case_sensitive: bool,
+    ext_checks: Vec<(String, bool)>,
+    custom_exts: String,
+    exclude_dirs: String,
+    exclude_file_substr: String,
+    max_mb: String,
+    use_gitignore: bool,
+    sort_by: SortBy,
+
+    results: Vec<SearchHit>,
+    searching: bool,
+    scanned: Arc<AtomicUsize>,
+    elapsed_ms: u64,
+    error: String,
+    selected: Option<usize>,
+
+    rx: Option<Receiver<Msg>>,
+    cancel: Option<Arc<AtomicBool>>,
+}
+
+impl SearchApp {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // ---- Global look ----
+        let mut style = (*cc.egui_ctx.style()).clone();
+        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+        style.spacing.button_padding = egui::vec2(10.0, 6.0);
+        style.spacing.indent = 18.0;
+        style.text_styles.insert(
+            egui::TextStyle::Heading,
+            egui::FontId::new(22.0, egui::FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Body,
+            egui::FontId::new(14.0, egui::FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Small,
+            egui::FontId::new(11.5, egui::FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Monospace,
+            egui::FontId::new(12.5, egui::FontFamily::Monospace),
+        );
+        cc.egui_ctx.set_style(style);
+        let mut visuals = egui::Visuals::dark();
+        visuals.selection.bg_fill = egui::Color32::from_rgb(37, 99, 235);
+        visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(55, 65, 81);
+        cc.egui_ctx.set_visuals(visuals);
+
+        // Restore last session; fall back to find.py defaults on first run.
+        let prefs = load_prefs();
+        let first_run = prefs.root.trim().is_empty();
+        let ext_on: HashSet<String> = prefs.ext_on.into_iter().collect();
+
+        Self {
+            root: if first_run {
+                String::from(r"D:\workspace\fv")
+            } else {
+                prefs.root
+            },
+            query: if first_run {
+                String::from("arquivos")
+            } else {
+                prefs.query
+            },
+            recursive: if first_run { true } else { prefs.recursive },
+            case_sensitive: if first_run {
+                true
+            } else {
+                prefs.case_sensitive
+            },
+            ext_checks: PRESET_EXTS
+                .iter()
+                .map(|e| {
+                    let on = if first_run {
+                        *e == "py" // find.py default
+                    } else {
+                        ext_on.contains(*e)
+                    };
+                    (e.to_string(), on)
+                })
+                .collect(),
+            custom_exts: prefs.custom_exts,
+            exclude_dirs: if first_run {
+                String::from("node_module,venv,dist,build")
+            } else {
+                prefs.exclude_dirs
+            },
+            exclude_file_substr: if first_run {
+                String::from("util,clean")
+            } else {
+                prefs.exclude_file_substr
+            },
+            max_mb: if first_run {
+                String::from("10")
+            } else {
+                prefs.max_mb
+            },
+            use_gitignore: if first_run {
+                true
+            } else {
+                prefs.use_gitignore
+            },
+            sort_by: prefs.sort_by,
+            results: Vec::new(),
+            searching: false,
+            scanned: Arc::new(AtomicUsize::new(0)),
+            elapsed_ms: 0,
+            error: String::new(),
+            selected: None,
+            rx: None,
+            cancel: None,
+        }
+    }
+
+    fn build_params(&self) -> Result<SearchParams, String> {
+        let root = PathBuf::from(self.root.trim());
+        if self.root.trim().is_empty() {
+            return Err(String::from("Pick a folder first."));
+        }
+        if !root.exists() {
+            return Err(format!("Folder does not exist: {}", root.display()));
+        }
+        if !root.is_dir() {
+            return Err(format!("Not a folder: {}", root.display()));
+        }
+
+        let mut exts: HashSet<String> = HashSet::new();
+        for (e, on) in &self.ext_checks {
+            if *on {
+                exts.insert(e.to_lowercase());
+            }
+        }
+        for part in self.custom_exts.split([',', ';', ' ', '|']) {
+            let t = part.trim().trim_start_matches('.').to_lowercase();
+            if !t.is_empty() {
+                exts.insert(t);
+            }
+        }
+
+        let exclude_dirs: Vec<String> = self
+            .exclude_dirs
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let exclude_file_substr: Vec<String> = self
+            .exclude_file_substr
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let max_mb: f64 = self.max_mb.trim().parse().unwrap_or(10.0);
+        let max_bytes = ((max_mb.max(0.0)) * 1024.0 * 1024.0) as u64;
+
+        Ok(SearchParams {
+            root,
+            query: self.query.clone(),
+            query_lower: self.query.to_lowercase(),
+            recursive: self.recursive,
+            case_sensitive: self.case_sensitive,
+            exts,
+            exclude_dirs,
+            exclude_file_substr,
+            max_bytes,
+            use_gitignore: self.use_gitignore,
+        })
+    }
+
+    /// Native folder browser. Called on UI thread (required on Windows for COM).
+    fn browse_folder(&mut self) {
+        let mut dlg = rfd::FileDialog::new().set_title("Choose folder to search");
+        let cur = self.root.trim().to_string();
+        if !cur.is_empty() {
+            let p = PathBuf::from(&cur);
+            let base = if p.is_dir() {
+                p
+            } else {
+                p.parent().map(|x| x.to_path_buf()).unwrap_or(p)
+            };
+            if base.is_dir() {
+                dlg = dlg.set_directory(base);
+            }
+        }
+        if let Some(p) = dlg.pick_folder() {
+            self.root = p.to_string_lossy().to_string();
+            self.error.clear();
+            save_prefs(self);
+        }
+    }
+
+    fn start_search(&mut self) {
+        let params = match self.build_params() {
+            Ok(p) => p,
+            Err(e) => {
+                self.error = e;
+                return;
+            }
+        };
+        self.error.clear();
+        self.results.clear();
+        self.selected = None;
+        self.elapsed_ms = 0;
+        self.searching = true;
+        save_prefs(self); // remember folder + term + filters
+
+        let (tx, rx): (Sender<Msg>, Receiver<Msg>) = unbounded();
+        self.rx = Some(rx);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel = Some(cancel.clone());
+        let scanned = self.scanned.clone();
+        scanned.store(0, Ordering::Relaxed);
+
+        std::thread::spawn(move || {
+            let t0 = Instant::now();
+            if let Err(e) = run_search_blocking(&params, &tx, &cancel, &scanned) {
+                let _ = tx.send(Msg::Error(e));
+                return;
+            }
+            let _ = tx.send(Msg::Done {
+                elapsed_ms: t0.elapsed().as_millis() as u64,
+            });
+        });
+    }
+
+    fn stop_search(&mut self) {
+        if let Some(c) = &self.cancel {
+            c.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn poll_rx(&mut self) {
+        // Drain up to N msgs per frame so UI stays responsive.
+        if let Some(rx) = self.rx.clone() {
+            for _ in 0..500 {
+                match rx.try_recv() {
+                    Ok(Msg::Hit(h)) => self.results.push(h),
+                    Ok(Msg::Done { elapsed_ms }) => {
+                        self.elapsed_ms = elapsed_ms;
+                        self.searching = false;
+                        self.rx = None;
+                        self.cancel = None;
+                        self.apply_sort();
+                        break;
+                    }
+                    Ok(Msg::Error(e)) => {
+                        self.error = e;
+                        self.searching = false;
+                        self.rx = None;
+                        self.cancel = None;
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+
+    fn apply_sort(&mut self) {
+        match self.sort_by {
+            SortBy::Modified => self.results.sort_by_key(|h| h.modified_unix),
+            SortBy::Path => self.results.sort_by(|a, b| a.path.cmp(&b.path)),
+            SortBy::Size => self.results.sort_by_key(|h| h.size),
+        }
+    }
+
+    fn folder_valid(&self) -> bool {
+        !self.root.trim().is_empty() && Path::new(self.root.trim()).is_dir()
+    }
+
+    /// Left sidebar: folder picker + filters + options.
+    fn show_sidebar(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Filters");
+        ui.separator();
+
+        // ---- Folder ----
+        ui.label(egui::RichText::new("📁 Folder").strong());
+        ui.add(
+            egui::TextEdit::singleline(&mut self.root)
+                .desired_width(f32::INFINITY)
+                .hint_text(r"D:\workspace\fv"),
+        );
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::Button::new(egui::RichText::new("📂 Browse…").strong())
+                        .min_size(egui::vec2(110.0, 0.0)),
+                )
+                .clicked()
+            {
+                self.browse_folder();
+            }
+            if ui.small_button("Reveal").clicked() && self.folder_valid() {
+                let _ = open::that(self.root.trim());
+            }
+        });
+        if self.root.trim().is_empty() {
+            ui.label(egui::RichText::new("Pick a folder to start.").weak());
+        } else if self.folder_valid() {
+            ui.label(egui::RichText::new("✓ valid folder").color(GREEN).small());
+        } else {
+            ui.label(egui::RichText::new("✗ folder not found").color(RED).small());
+        }
+
+        ui.separator();
+
+        // ---- Extensions ----
+        ui.label(egui::RichText::new("🧩 Extensions").strong());
+        ui.label(
+            egui::RichText::new("Empty selection = all files")
+                .weak()
+                .small(),
+        );
+        ui.horizontal(|ui| {
+            if ui.small_button("All").clicked() {
+                for (_, on) in self.ext_checks.iter_mut() {
+                    *on = true;
+                }
+            }
+            if ui.small_button("None").clicked() {
+                for (_, on) in self.ext_checks.iter_mut() {
+                    *on = false;
+                }
+            }
+            if ui.small_button("Code").clicked() {
+                let code: HashSet<&str> = [
+                    "py", "js", "ts", "tsx", "jsx", "rs", "go", "java", "c", "h", "cpp",
+                    "cs",
+                ]
+                .into_iter()
+                .collect();
+                for (e, on) in self.ext_checks.iter_mut() {
+                    *on = code.contains(e.as_str());
+                }
+            }
+        });
+        egui::Grid::new("exts")
+            .num_columns(4)
+            .spacing([6.0, 2.0])
+            .show(ui, |ui| {
+                for (i, (ext, on)) in self.ext_checks.iter_mut().enumerate() {
+                    ui.checkbox(on, format!(".{ext}"));
+                    if (i + 1) % 4 == 0 {
+                        ui.end_row();
+                    }
+                }
+            });
+        ui.horizontal(|ui| {
+            ui.label("Custom:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.custom_exts)
+                    .desired_width(140.0)
+                    .hint_text("env, cfg"),
+            );
+        });
+
+        ui.separator();
+
+        // ---- Options ----
+        ui.label(egui::RichText::new("⚙ Options").strong());
+        ui.checkbox(&mut self.case_sensitive, "Case sensitive");
+        ui.checkbox(&mut self.recursive, "Recursive (nested folders)");
+        ui.checkbox(&mut self.use_gitignore, "Respect .gitignore");
+
+        ui.collapsing("Excludes & limits", |ui| {
+            ui.label("Skip dirs (substring, comma):");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.exclude_dirs)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("node_module,venv,dist,build"),
+            );
+            ui.label("Skip path (substring, comma):");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.exclude_file_substr)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("util,clean"),
+            );
+            ui.horizontal(|ui| {
+                ui.label("Max MB:");
+                ui.add(egui::TextEdit::singleline(&mut self.max_mb).desired_width(50.0));
+            });
+        });
+    }
+
+    /// Search bar card on top of central panel. Returns true if search started.
+    fn show_searchbar(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Contains").strong());
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.query)
+                        .desired_width(340.0)
+                        .hint_text("arquivos (empty = match all files)"),
+                );
+                if resp.lost_focus()
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                    && !self.searching
+                {
+                    self.start_search();
+                }
+                if !self.searching {
+                    let btn = egui::Button::new(
+                        egui::RichText::new("🔍 Search").size(15.0).strong(),
+                    )
+                    .fill(ACCENT)
+                    .min_size(egui::vec2(130.0, 30.0));
+                    if ui.add_enabled(self.folder_valid(), btn).clicked() {
+                        self.start_search();
+                    }
+                } else {
+                    if ui
+                        .add(
+                            egui::Button::new("■ Stop")
+                                .min_size(egui::vec2(130.0, 30.0)),
+                        )
+                        .clicked()
+                    {
+                        self.stop_search();
+                    }
+                    ui.spinner();
+                }
+                if ui.small_button("Clear").clicked() {
+                    self.results.clear();
+                    self.error.clear();
+                    self.elapsed_ms = 0;
+                    self.scanned.store(0, Ordering::Relaxed);
+                    self.selected = None;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Sort:");
+                egui::ComboBox::from_id_salt("sort")
+                    .selected_text(match self.sort_by {
+                        SortBy::Modified => "modified ↑ (find.py)",
+                        SortBy::Path => "path",
+                        SortBy::Size => "size",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.sort_by,
+                            SortBy::Modified,
+                            "modified ↑ (find.py)",
+                        );
+                        ui.selectable_value(&mut self.sort_by, SortBy::Path, "path");
+                        ui.selectable_value(&mut self.sort_by, SortBy::Size, "size");
+                    });
+                if ui.small_button("Re-sort").clicked() {
+                    self.apply_sort();
+                }
+                ui.label(
+                    egui::RichText::new("Tip: click any result to open it")
+                        .weak()
+                        .small(),
+                );
+            });
+        });
+
+        if !self.error.is_empty() {
+            ui.colored_label(RED, &self.error);
+        }
+    }
+}
+
+fn path_excluded(path: &Path, root: &Path, exclude_dirs: &[String]) -> bool {
+    if exclude_dirs.is_empty() {
+        return false;
+    }
+    // Mirror find.py substring check on full path ("node_module" in filepath).
+    let s = path.to_string_lossy();
+    // Only test the part under root to avoid drive-letter false positives.
+    let rel = path
+        .strip_prefix(root)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or(s.to_string());
+    exclude_dirs.iter().any(|d| rel.contains(d))
+}
+
+fn file_name_excluded(path: &Path, pats: &[String]) -> bool {
+    if pats.is_empty() {
+        return false;
+    }
+    let s = path.to_string_lossy();
+    pats.iter().any(|p| s.contains(p))
+}
+
+fn ext_allowed(path: &Path, exts: &HashSet<String>) -> bool {
+    if exts.is_empty() {
+        return true; // nothing checked = all files
+    }
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(e) => exts.contains(&e.to_lowercase()),
+        None => false,
+    }
+}
+
+fn run_search_blocking(
+    params: &SearchParams,
+    tx: &Sender<Msg>,
+    cancel: &AtomicBool,
+    scanned: &AtomicUsize,
+) -> Result<(), String> {
+    let mut builder = WalkBuilder::new(&params.root);
+    builder
+        .hidden(false)
+        .git_ignore(params.use_gitignore)
+        .parents(params.use_gitignore)
+        .ignore(params.use_gitignore)
+        .git_exclude(params.use_gitignore)
+        .follow_links(false)
+        .require_git(false);
+    if !params.recursive {
+        builder.max_depth(Some(1));
+    }
+
+    // Stage 1: fast serial walk, collect candidate files.
+    let mut candidates: Vec<PathBuf> = Vec::with_capacity(8192);
+    for entry in builder.build() {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let p = entry.path().to_path_buf();
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        if !entry
+            .file_type()
+            .map(|t| t.is_file())
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        if path_excluded(&p, &params.root, &params.exclude_dirs) {
+            continue;
+        }
+        if file_name_excluded(&p, &params.exclude_file_substr) {
+            continue;
+        }
+        if !ext_allowed(&p, &params.exts) {
+            continue;
+        }
+        // Cheap size pre-filter.
+        if let Ok(md) = entry.metadata() {
+            if md.len() > params.max_bytes && params.max_bytes > 0 {
+                continue;
+            }
+        }
+        candidates.push(p);
+    }
+
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    // Stage 2: parallel content read + match (rayon).
+    let query_empty = params.query.is_empty();
+    candidates.par_iter().for_each(|p| {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        scanned.fetch_add(1, Ordering::Relaxed);
+
+        // Re-check size from filesystem (walk metadata can lie on Windows).
+        let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        if params.max_bytes > 0 && size > params.max_bytes {
+            return;
+        }
+
+        if query_empty {
+            let modified_unix = std::fs::metadata(p)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let _ = tx.send(Msg::Hit(SearchHit {
+                path: p.to_string_lossy().to_string(),
+                modified_unix,
+                size,
+                matches: 0,
+                preview: String::new(),
+            }));
+            return;
+        }
+
+        let bytes = match std::fs::read(p) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        // Skip likely-binary early (NUL in first 1KB) unless query itself needs it.
+        if bytes.len() > 1024 && bytes[..1024].contains(&0) {
+            return;
+        }
+        let text = String::from_utf8_lossy(&bytes);
+
+        let (found, count, preview) = if params.case_sensitive {
+            let c = text.matches(params.query.as_str()).count();
+            if c == 0 {
+                return;
+            }
+            let pv = first_match_line(&text, &params.query, true);
+            (true, c, pv)
+        } else {
+            let lower = text.to_lowercase();
+            let c = lower.matches(params.query_lower.as_str()).count();
+            if c == 0 {
+                return;
+            }
+            let pv = first_match_line_lower(&text, &params.query_lower);
+            (true, c, pv)
+        };
+        if !found {
+            return;
+        }
+
+        let modified_unix = std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let _ = tx.send(Msg::Hit(SearchHit {
+            path: p.to_string_lossy().to_string(),
+            modified_unix,
+            size,
+            matches: count,
+            preview,
+        }));
+    });
+
+    Ok(())
+}
+
+fn first_match_line(text: &str, needle: &str, _cs: bool) -> String {
+    for line in text.lines() {
+        if line.contains(needle) {
+            return truncate(line.trim(), 140);
+        }
+    }
+    String::new()
+}
+
+fn first_match_line_lower(text: &str, needle_lower: &str) -> String {
+    for line in text.lines() {
+        if line.to_lowercase().contains(needle_lower) {
+            return truncate(line.trim(), 140);
+        }
+    }
+    String::new()
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    for (i, c) in s.char_indices() {
+        if i >= max {
+            break;
+        }
+        out.push(c);
+    }
+    out.push('…');
+    out
+}
+
+fn fmt_time(unix: i64) -> String {
+    DateTime::<Local>::from(
+        UNIX_EPOCH
+            .checked_add(std::time::Duration::from_secs(unix.max(0) as u64))
+            .unwrap_or(UNIX_EPOCH),
+    )
+    .format("%Y-%m-%d %H:%M:%S")
+    .to_string()
+}
+
+fn fmt_size(b: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    if b < 1024 {
+        format!("{} B", b)
+    } else if (b as f64) < MB {
+        format!("{:.1} KB", b as f64 / KB)
+    } else {
+        format!("{:.2} MB", b as f64 / MB)
+    }
+}
+
+fn split_path(p: &str) -> (String, String) {
+    let path = Path::new(p);
+    let fname = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| p.to_string());
+    let folder = path
+        .parent()
+        .map(|x| x.to_string_lossy().to_string())
+        .unwrap_or_default();
+    (fname, folder)
+}
+
+fn icon_for_ext(p: &str) -> &'static str {
+    let ext = Path::new(p)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "py" => "🐍",
+        "js" | "ts" | "jsx" | "tsx" => "📜",
+        "rs" => "🦀",
+        "go" => "🐹",
+        "java" => "☕",
+        "c" | "h" | "cpp" | "cs" => "⚙",
+        "html" | "css" => "🌐",
+        "json" | "xml" | "yaml" | "yml" | "toml" => "🧾",
+        "md" | "txt" | "log" => "📝",
+        "csv" | "sql" => "📊",
+        _ => "📄",
+    }
+}
+
+impl eframe::App for SearchApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.searching {
+            self.poll_rx();
+            ctx.request_repaint(); // live results
+        } else if self.rx.is_some() {
+            self.poll_rx();
+        }
+
+        // ---- Header ----
+        egui::TopBottomPanel::top("top").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("fv-search");
+                ui.label(
+                    egui::RichText::new("parallel file search — Rust port of find.py")
+                        .weak()
+                        .small(),
+                );
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        let scanned = self.scanned.load(Ordering::Relaxed);
+                        if self.searching {
+                            ui.spinner();
+                            ui.label(format!(
+                                "{} scanned • {} matched",
+                                scanned,
+                                self.results.len()
+                            ));
+                        } else if self.elapsed_ms > 0 || !self.results.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "✓ {} scanned • {} matched • {} ms",
+                                    scanned,
+                                    self.results.len(),
+                                    self.elapsed_ms
+                                ))
+                                .color(GREEN)
+                                .small(),
+                            );
+                        } else {
+                            ui.label(
+                                egui::RichText::new("idle — pick folder → Search")
+                                    .weak()
+                                    .small(),
+                            );
+                        }
+                    },
+                );
+            });
+        });
+
+        // ---- Sidebar ----
+        egui::SidePanel::left("side")
+            .resizable(true)
+            .default_width(290.0)
+            .width_range(240.0..=420.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    self.show_sidebar(ui);
+                });
+            });
+
+        // ---- Main ----
+        egui::CentralPanel::default().show(ctx, |ui| {
+            self.show_searchbar(ui);
+            ui.add_space(4.0);
+
+            // Selected file action bar.
+            if let Some(hit) = self.selected.and_then(|i| self.results.get(i)).cloned()
+            {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("👉").size(16.0));
+                        ui.label(
+                            egui::RichText::new(hit.path.clone())
+                                .monospace()
+                                .small(),
+                        );
+                    });
+                    if !hit.preview.is_empty() {
+                        ui.monospace(format!("› {}", hit.preview));
+                    }
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new("📄 Open file")
+                                    .fill(ACCENT)
+                                    .min_size(egui::vec2(110.0, 0.0)),
+                            )
+                            .clicked()
+                        {
+                            let _ = open::that(&hit.path);
+                        }
+                        if ui.small_button("📂 Folder").clicked() {
+                            if let Some(parent) = Path::new(&hit.path).parent() {
+                                let _ = open::that(parent);
+                            }
+                        }
+                        if ui.small_button("⧉ Copy path").clicked() {
+                            ctx.copy_text(hit.path.clone());
+                        }
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} • {}",
+                                fmt_time(hit.modified_unix),
+                                fmt_size(hit.size)
+                            ))
+                            .weak()
+                            .small(),
+                        );
+                    });
+                });
+                ui.add_space(4.0);
+            }
+
+            // ---- Results ----
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("Results ({})", self.results.len()))
+                        .strong()
+                        .size(16.0),
+                );
+            });
+
+            if self.results.is_empty() {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(40.0);
+                    if self.searching {
+                        ui.spinner();
+                        ui.label("Searching… results stream in live.");
+                    } else {
+                        ui.label(egui::RichText::new("🔍").size(40.0));
+                        ui.label(
+                            egui::RichText::new(
+                                "No results yet.\nPick a folder, type a keyword, hit Search.\nClick any result to open the file.",
+                            )
+                            .weak(),
+                        );
+                    }
+                });
+                return;
+            }
+
+            egui::ScrollArea::vertical()
+                .auto_shrink([false; 2])
+                .show(ui, |ui| {
+                    // Cap rendered rows to keep UI fast on huge result sets.
+                    const RENDER_CAP: usize = 5000;
+                    let n = self.results.len().min(RENDER_CAP);
+                    let mut to_open: Option<String> = None;
+                    let mut select: Option<usize> = None;
+
+                    for i in 0..n {
+                        let h = &self.results[i];
+                        let (fname, folder) = split_path(&h.path);
+                        let sel = self.selected == Some(i);
+                        let bg = if sel {
+                            egui::Color32::from_rgb(30, 58, 138)
+                        } else if i % 2 == 0 {
+                            egui::Color32::from_rgb(24, 24, 27)
+                        } else {
+                            egui::Color32::from_rgb(30, 30, 34)
+                        };
+
+                        let resp = egui::Frame::new()
+                            .fill(bg)
+                            .corner_radius(6)
+                            .inner_margin(egui::Margin::symmetric(8, 5))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(icon_for_ext(&h.path))
+                                            .size(18.0),
+                                    );
+                                    ui.vertical(|ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(fname)
+                                                    .strong()
+                                                    .size(13.5),
+                                            );
+                                            if h.matches > 0 {
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "{}×",
+                                                        h.matches
+                                                    ))
+                                                    .color(GREEN)
+                                                    .small()
+                                                    .strong(),
+                                                );
+                                            }
+                                        });
+                                        ui.label(
+                                            egui::RichText::new(folder)
+                                                .weak()
+                                                .small()
+                                                .monospace(),
+                                        );
+                                        if !h.preview.is_empty() {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "› {}",
+                                                    h.preview
+                                                ))
+                                                .small(),
+                                            );
+                                        }
+                                    });
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(
+                                            egui::Align::Center,
+                                        ),
+                                        |ui| {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "{}\n{}",
+                                                    fmt_size(h.size),
+                                                    fmt_time(h.modified_unix)
+                                                ))
+                                                .weak()
+                                                .small(),
+                                            );
+                                        },
+                                    );
+                                });
+                            })
+                            .response;
+
+                        // SINGLE CLICK = open file (per user request).
+                        if resp.clicked() {
+                            select = Some(i);
+                            to_open = Some(h.path.clone());
+                        }
+                        resp.context_menu(|ui| {
+                            if ui.button("📄 Open file").clicked() {
+                                to_open = Some(h.path.clone());
+                                ui.close();
+                            }
+                            if ui.button("📂 Open containing folder").clicked() {
+                                if let Some(parent) =
+                                    Path::new(&h.path).parent()
+                                {
+                                    let _ = open::that(parent);
+                                }
+                                ui.close();
+                            }
+                            if ui.button("⧉ Copy path").clicked() {
+                                ctx.copy_text(h.path.clone());
+                                ui.close();
+                            }
+                        });
+                    }
+
+                    if let Some(i) = select {
+                        self.selected = Some(i);
+                    }
+                    if let Some(p) = to_open {
+                        let _ = open::that(p);
+                    }
+
+                    if self.results.len() > RENDER_CAP {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "… +{} more (refine query)",
+                                self.results.len() - RENDER_CAP
+                            ))
+                            .weak(),
+                        );
+                    }
+                });
+        });
+    }
+}
