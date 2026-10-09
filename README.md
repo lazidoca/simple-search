@@ -3,7 +3,18 @@
 Cross-platform GUI for fast parallel file-content search. Pick a folder,
 type a keyword, get a live result list. Single binary, no runtime needed.
 
-## Run
+## Download binary
+
+Releases page → tải file theo OS (push tag `v*` là CI build tự động):
+
+- `fv-search-x86_64-pc-windows-msvc.zip` — Windows
+- `fv-search-x86_64-unknown-linux-gnu.tar.gz` — Linux
+- `fv-search-aarch64-apple-darwin.tar.gz` — macOS (Apple Silicon)
+
+macOS chưa sign: mở lần đầu bằng chuột phải → Open, hoặc
+`xattr -d com.apple.quarantine fv-search`.
+
+## Run from source
 
 ```sh
 cd search

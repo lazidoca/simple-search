@@ -502,49 +502,49 @@ impl SearchApp {
         ui.separator();
 
         // ---- Folder ----
-        ui.label(egui::RichText::new("📁 Folder").strong());
+        ui.label(egui::RichText::new("Folder").strong());
         ui.add(
             egui::TextEdit::singleline(&mut self.root)
                 .desired_width(f32::INFINITY)
                 .hint_text("pick a folder…"),
         );
         ui.horizontal(|ui| {
-            if ui.add(btn("📂 Browse…", 120.0)).clicked() {
+            if ui.add(btn("Browse…", 120.0)).clicked() {
                 self.browse_folder();
             }
-            if ui.add(btn("👁 Reveal", 100.0)).clicked() && self.folder_valid() {
+            if ui.add(btn("Reveal", 100.0)).clicked() && self.folder_valid() {
                 let _ = open::that(self.root.trim());
             }
         });
         if self.root.trim().is_empty() {
             ui.label(egui::RichText::new("Pick a folder to start.").weak());
         } else if self.folder_valid() {
-            ui.label(egui::RichText::new("✓ valid folder").color(GREEN).small());
+            ui.label(egui::RichText::new("valid folder").color(GREEN).small());
         } else {
-            ui.label(egui::RichText::new("✗ folder not found").color(RED).small());
+            ui.label(egui::RichText::new("folder not found").color(RED).small());
         }
 
         ui.separator();
 
         // ---- Extensions ----
-        ui.label(egui::RichText::new("🧩 Extensions").strong());
+        ui.label(egui::RichText::new("Extensions").strong());
         ui.label(
             egui::RichText::new("Empty selection = all files")
                 .weak()
                 .small(),
         );
         ui.horizontal(|ui| {
-            if ui.small_button("☑ All").clicked() {
+            if ui.small_button("All").clicked() {
                 for (_, on) in self.ext_checks.iter_mut() {
                     *on = true;
                 }
             }
-            if ui.small_button("☐ None").clicked() {
+            if ui.small_button("None").clicked() {
                 for (_, on) in self.ext_checks.iter_mut() {
                     *on = false;
                 }
             }
-            if ui.small_button("</> Code").clicked() {
+            if ui.small_button("Code").clicked() {
                 let code: HashSet<&str> = [
                     "py", "js", "ts", "tsx", "jsx", "rs", "go", "java", "c", "h", "cpp",
                     "cs",
@@ -579,7 +579,7 @@ impl SearchApp {
         ui.separator();
 
         // ---- Options ----
-        ui.label(egui::RichText::new("⚙ Options").strong());
+        ui.label(egui::RichText::new("Options").strong());
         ui.checkbox(&mut self.case_sensitive, "Case sensitive");
         ui.checkbox(&mut self.recursive, "Recursive (nested folders)");
         ui.checkbox(&mut self.use_gitignore, "Respect .gitignore");
@@ -622,7 +622,7 @@ impl SearchApp {
                 }
                 if !self.searching {
                     let search = egui::Button::new(
-                        egui::RichText::new("🔍 Search").size(15.0).strong(),
+                        egui::RichText::new("Search").size(15.0).strong(),
                     )
                     .fill(ACCENT)
                     .min_size(egui::vec2(140.0, BTN_H + 2.0));
@@ -630,12 +630,12 @@ impl SearchApp {
                         self.start_search();
                     }
                 } else {
-                    if ui.add(btn("■ Stop", 140.0)).clicked() {
+                    if ui.add(btn("Stop", 140.0)).clicked() {
                         self.stop_search();
                     }
                     ui.spinner();
                 }
-                if ui.add(btn("🧹 Clear", 100.0)).clicked() {
+                if ui.add(btn("Clear", 100.0)).clicked() {
                     self.results.clear();
                     self.error.clear();
                     self.elapsed_ms = 0;
@@ -650,7 +650,7 @@ impl SearchApp {
                 ui.label("Sort:");
                 egui::ComboBox::from_id_salt("sort")
                     .selected_text(match self.sort_by {
-                        SortBy::Modified => "modified ↑",
+                        SortBy::Modified => "modified time",
                         SortBy::Path => "path",
                         SortBy::Size => "size",
                     })
@@ -658,12 +658,12 @@ impl SearchApp {
                         ui.selectable_value(
                             &mut self.sort_by,
                             SortBy::Modified,
-                            "modified ↑",
+                            "modified time",
                         );
                         ui.selectable_value(&mut self.sort_by, SortBy::Path, "path");
                         ui.selectable_value(&mut self.sort_by, SortBy::Size, "size");
                     });
-                if ui.small_button("🔃 Re-sort").clicked() {
+                if ui.small_button("Re-sort").clicked() {
                     self.apply_sort();
                 }
                 ui.label(
@@ -988,24 +988,45 @@ fn split_path(p: &str) -> (String, String) {
     (fname, folder)
 }
 
-fn icon_for_ext(p: &str) -> &'static str {
+/// Short uppercase tag + color per extension. Pure ASCII text, so it
+/// renders with any font (no emoji-font dependency).
+fn ext_badge(p: &str) -> (String, egui::Color32) {
     let ext = Path::new(p)
         .extension()
         .and_then(|e| e.to_str())
         .map(|s| s.to_lowercase())
         .unwrap_or_default();
+    let green = egui::Color32::from_rgb(74, 222, 128);
+    let yellow = egui::Color32::from_rgb(250, 204, 21);
+    let blue = egui::Color32::from_rgb(96, 165, 250);
+    let orange = egui::Color32::from_rgb(251, 146, 60);
+    let cyan = egui::Color32::from_rgb(34, 211, 238);
+    let red = egui::Color32::from_rgb(248, 113, 113);
+    let purple = egui::Color32::from_rgb(192, 132, 252);
+    let pink = egui::Color32::from_rgb(244, 114, 182);
+    let teal = egui::Color32::from_rgb(45, 212, 191);
+    let gray = egui::Color32::from_rgb(148, 163, 184);
     match ext.as_str() {
-        "py" => "🐍",
-        "js" | "ts" | "jsx" | "tsx" => "📜",
-        "rs" => "🦀",
-        "go" => "🐹",
-        "java" => "☕",
-        "c" | "h" | "cpp" | "cs" => "⚙",
-        "html" | "css" => "🌐",
-        "json" | "xml" | "yaml" | "yml" | "toml" => "🧾",
-        "md" | "txt" | "log" => "📝",
-        "csv" | "sql" => "📊",
-        _ => "📄",
+        "py" => ("PY".into(), green),
+        "js" | "jsx" => ("JS".into(), yellow),
+        "ts" => ("TS".into(), blue),
+        "tsx" => ("TSX".into(), blue),
+        "rs" => ("RS".into(), orange),
+        "go" => ("GO".into(), cyan),
+        "java" => ("JAVA".into(), red),
+        "c" | "h" => (ext.to_uppercase(), purple),
+        "cpp" => ("C++".into(), purple),
+        "cs" => ("C#".into(), purple),
+        "html" => ("HTML".into(), pink),
+        "css" => ("CSS".into(), pink),
+        "json" | "xml" | "yaml" | "yml" | "toml" => (ext.to_uppercase(), gray),
+        "csv" | "sql" => (ext.to_uppercase(), teal),
+        "md" | "txt" | "log" => (ext.to_uppercase(), gray),
+        _ if ext.is_empty() => ("FILE".into(), gray),
+        _ => (
+            ext.to_uppercase().chars().take(4).collect(),
+            gray,
+        ),
     }
 }
 
@@ -1041,7 +1062,7 @@ impl eframe::App for SearchApp {
                         } else if self.elapsed_ms > 0 || !self.results.is_empty() {
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "✓ {} visited • {} read • {} matched • {} ms (walk {} + match {})",
+                                    "{} visited • {} read • {} matched • {} ms (walk {} + match {})",
                                     self.walked,
                                     scanned,
                                     self.results.len(),
@@ -1054,7 +1075,7 @@ impl eframe::App for SearchApp {
                             );
                         } else {
                             ui.label(
-                                egui::RichText::new("idle — pick folder → Search")
+                                    egui::RichText::new("idle — pick folder, then Search")
                                     .weak()
                                     .small(),
                             );
@@ -1085,7 +1106,7 @@ impl eframe::App for SearchApp {
             {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("👉").size(16.0));
+                        ui.label(egui::RichText::new("Selected:").strong());
                         ui.label(
                             egui::RichText::new(hit.path.clone())
                                 .monospace()
@@ -1096,19 +1117,19 @@ impl eframe::App for SearchApp {
                         ui.monospace(format!("› {}", hit.preview));
                     }
                     ui.horizontal(|ui| {
-                        if ui.add(btn("📄 Open file", 120.0).fill(ACCENT)).clicked()
+                        if ui.add(btn("Open file", 120.0).fill(ACCENT)).clicked()
                         {
                             if let Err(e) = open::that(&hit.path) {
                                 self.error =
                                     format!("Cannot open {}: {}", hit.path, e);
                             }
                         }
-                        if ui.add(btn("📂 Folder", 100.0)).clicked() {
+                        if ui.add(btn("Folder", 100.0)).clicked() {
                             if let Some(parent) = Path::new(&hit.path).parent() {
                                 let _ = open::that(parent);
                             }
                         }
-                        if ui.add(btn("⧉ Copy path", 110.0)).clicked() {
+                        if ui.add(btn("Copy path", 110.0)).clicked() {
                             ctx.copy_text(hit.path.clone());
                         }
                         ui.label(
@@ -1141,7 +1162,6 @@ impl eframe::App for SearchApp {
                         ui.spinner();
                         ui.label("Searching… results stream in live.");
                     } else {
-                        ui.label(egui::RichText::new("🔍").size(40.0));
                         ui.label(
                             egui::RichText::new(
                                 "No results yet.\nPick a folder, type a keyword, hit Search.\nClick any result to open the file.",
@@ -1182,10 +1202,20 @@ impl eframe::App for SearchApp {
                             .inner_margin(egui::Margin::symmetric(8, 5))
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new(icon_for_ext(&h.path))
-                                            .size(18.0),
-                                    );
+                                    let (tag, tag_color) = ext_badge(&h.path);
+                                    egui::Frame::new()
+                                        .fill(egui::Color32::from_rgb(18, 18, 22))
+                                        .corner_radius(4)
+                                        .inner_margin(egui::Margin::symmetric(6, 3))
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                egui::RichText::new(tag)
+                                                    .monospace()
+                                                    .strong()
+                                                    .size(12.0)
+                                                    .color(tag_color),
+                                            );
+                                        });
                                     ui.vertical(|ui| {
                                         ui.horizontal(|ui| {
                                             ui.label(
@@ -1259,11 +1289,11 @@ impl eframe::App for SearchApp {
                             to_open = Some(h.path.clone());
                         }
                         resp.context_menu(|ui| {
-                            if ui.button("📄 Open file").clicked() {
+                            if ui.button("Open file").clicked() {
                                 to_open = Some(h.path.clone());
                                 ui.close();
                             }
-                            if ui.button("📂 Open containing folder").clicked() {
+                            if ui.button("Open containing folder").clicked() {
                                 if let Some(parent) =
                                     Path::new(&h.path).parent()
                                 {
@@ -1271,7 +1301,7 @@ impl eframe::App for SearchApp {
                                 }
                                 ui.close();
                             }
-                            if ui.button("⧉ Copy path").clicked() {
+                            if ui.button("Copy path").clicked() {
                                 ctx.copy_text(h.path.clone());
                                 ui.close();
                             }
