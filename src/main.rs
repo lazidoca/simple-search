@@ -230,19 +230,20 @@ impl SearchApp {
         visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(55, 65, 81);
         cc.egui_ctx.set_visuals(visuals);
 
-        // Restore last session; built-in defaults on first run.
+        // Restore last session; first launch starts blank (no preset path/term).
         let prefs = load_prefs();
-        let first_run = prefs.root.trim().is_empty();
+        let first_run = prefs_path().map(|p| !p.exists()).unwrap_or(true)
+            && legacy_prefs_path().map(|p| !p.exists()).unwrap_or(true);
         let ext_on: HashSet<String> = prefs.ext_on.into_iter().collect();
 
         Self {
             root: if first_run {
-                String::from(r"D:\workspace\fv")
+                String::new()
             } else {
                 prefs.root
             },
             query: if first_run {
-                String::from("arquivos")
+                String::new()
             } else {
                 prefs.query
             },
@@ -481,7 +482,7 @@ impl SearchApp {
         ui.add(
             egui::TextEdit::singleline(&mut self.root)
                 .desired_width(f32::INFINITY)
-                .hint_text(r"D:\workspace\fv"),
+                .hint_text("pick a folder…"),
         );
         ui.horizontal(|ui| {
             if ui
@@ -593,7 +594,7 @@ impl SearchApp {
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut self.query)
                         .desired_width(340.0)
-                        .hint_text("arquivos (empty = match all files)"),
+                        .hint_text("keyword — empty lists all files"),
                 );
                 if resp.lost_focus()
                     && ui.input(|i| i.key_pressed(egui::Key::Enter))
