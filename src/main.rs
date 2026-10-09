@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use chrono::{DateTime, Local};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use serde::{Deserialize, Serialize};
@@ -164,7 +166,8 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1120.0, 740.0])
-            .with_min_inner_size([880.0, 600.0]),
+            .with_min_inner_size([880.0, 600.0])
+            .with_icon(app_icon()),
         ..Default::default()
     };
     eframe::run_native(
@@ -172,6 +175,27 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(SearchApp::new(cc)))),
     )
+}
+
+/// Window/taskbar icon, embedded from assets/icon.png.
+fn app_icon() -> egui::IconData {
+    let img = image::load_from_memory(include_bytes!("../assets/icon.png"))
+        .expect("bundled icon.png must decode")
+        .to_rgba8();
+    let (w, h) = (img.width(), img.height());
+    egui::IconData {
+        rgba: img.into_raw(),
+        width: w,
+        height: h,
+    }
+}
+
+/// Standard action button: uniform height everywhere, per-label min width.
+const BTN_H: f32 = 30.0;
+
+fn btn(label: &str, min_w: f32) -> egui::Button<'static> {
+    egui::Button::new(egui::RichText::new(label).size(14.0))
+        .min_size(egui::vec2(min_w, BTN_H))
 }
 
 struct SearchApp {
@@ -485,16 +509,10 @@ impl SearchApp {
                 .hint_text("pick a folder…"),
         );
         ui.horizontal(|ui| {
-            if ui
-                .add(
-                    egui::Button::new(egui::RichText::new("📂 Browse…").strong())
-                        .min_size(egui::vec2(110.0, 0.0)),
-                )
-                .clicked()
-            {
+            if ui.add(btn("📂 Browse…", 120.0)).clicked() {
                 self.browse_folder();
             }
-            if ui.small_button("Reveal").clicked() && self.folder_valid() {
+            if ui.add(btn("👁 Reveal", 100.0)).clicked() && self.folder_valid() {
                 let _ = open::that(self.root.trim());
             }
         });
@@ -516,17 +534,17 @@ impl SearchApp {
                 .small(),
         );
         ui.horizontal(|ui| {
-            if ui.small_button("All").clicked() {
+            if ui.small_button("☑ All").clicked() {
                 for (_, on) in self.ext_checks.iter_mut() {
                     *on = true;
                 }
             }
-            if ui.small_button("None").clicked() {
+            if ui.small_button("☐ None").clicked() {
                 for (_, on) in self.ext_checks.iter_mut() {
                     *on = false;
                 }
             }
-            if ui.small_button("Code").clicked() {
+            if ui.small_button("</> Code").clicked() {
                 let code: HashSet<&str> = [
                     "py", "js", "ts", "tsx", "jsx", "rs", "go", "java", "c", "h", "cpp",
                     "cs",
@@ -603,27 +621,21 @@ impl SearchApp {
                     self.start_search();
                 }
                 if !self.searching {
-                    let btn = egui::Button::new(
+                    let search = egui::Button::new(
                         egui::RichText::new("🔍 Search").size(15.0).strong(),
                     )
                     .fill(ACCENT)
-                    .min_size(egui::vec2(130.0, 30.0));
-                    if ui.add_enabled(self.folder_valid(), btn).clicked() {
+                    .min_size(egui::vec2(140.0, BTN_H + 2.0));
+                    if ui.add_enabled(self.folder_valid(), search).clicked() {
                         self.start_search();
                     }
                 } else {
-                    if ui
-                        .add(
-                            egui::Button::new("■ Stop")
-                                .min_size(egui::vec2(130.0, 30.0)),
-                        )
-                        .clicked()
-                    {
+                    if ui.add(btn("■ Stop", 140.0)).clicked() {
                         self.stop_search();
                     }
                     ui.spinner();
                 }
-                if ui.small_button("Clear").clicked() {
+                if ui.add(btn("🧹 Clear", 100.0)).clicked() {
                     self.results.clear();
                     self.error.clear();
                     self.elapsed_ms = 0;
@@ -651,7 +663,7 @@ impl SearchApp {
                         ui.selectable_value(&mut self.sort_by, SortBy::Path, "path");
                         ui.selectable_value(&mut self.sort_by, SortBy::Size, "size");
                     });
-                if ui.small_button("Re-sort").clicked() {
+                if ui.small_button("🔃 Re-sort").clicked() {
                     self.apply_sort();
                 }
                 ui.label(
@@ -1084,25 +1096,19 @@ impl eframe::App for SearchApp {
                         ui.monospace(format!("› {}", hit.preview));
                     }
                     ui.horizontal(|ui| {
-                        if ui
-                            .add(
-                                egui::Button::new("📄 Open file")
-                                    .fill(ACCENT)
-                                    .min_size(egui::vec2(110.0, 0.0)),
-                            )
-                            .clicked()
+                        if ui.add(btn("📄 Open file", 120.0).fill(ACCENT)).clicked()
                         {
                             if let Err(e) = open::that(&hit.path) {
                                 self.error =
                                     format!("Cannot open {}: {}", hit.path, e);
                             }
                         }
-                        if ui.small_button("📂 Folder").clicked() {
+                        if ui.add(btn("📂 Folder", 100.0)).clicked() {
                             if let Some(parent) = Path::new(&hit.path).parent() {
                                 let _ = open::that(parent);
                             }
                         }
-                        if ui.small_button("⧉ Copy path").clicked() {
+                        if ui.add(btn("⧉ Copy path", 110.0)).clicked() {
                             ctx.copy_text(hit.path.clone());
                         }
                         ui.label(
