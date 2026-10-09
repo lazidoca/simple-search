@@ -32,7 +32,12 @@ struct SearchHit {
 
 enum Msg {
     Hit(SearchHit),
-    Done { elapsed_ms: u64 },
+    Done {
+        elapsed_ms: u64,
+        walk_ms: u64,
+        match_ms: u64,
+        walked: usize,
+    },
     Error(String),
 }
 
@@ -64,7 +69,7 @@ impl Default for SortBy {
 }
 
 /// Persisted UI state: last folder, last search term, filters.
-/// Stored at OS config dir, e.g. %APPDATA%/fv-search/prefs.json (Windows).
+/// Stored next to the binary as prefs.json (e.g. beside fv-search.exe).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct Prefs {
@@ -81,14 +86,35 @@ struct Prefs {
     sort_by: SortBy,
 }
 
-fn prefs_path() -> Option<PathBuf> {
+fn legacy_prefs_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("fv-search").join("prefs.json"))
 }
 
+fn prefs_path() -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            return Some(dir.join("prefs.json"));
+        }
+    }
+    legacy_prefs_path()
+}
+
+fn read_prefs_file(p: &Path) -> Option<Prefs> {
+    std::fs::read_to_string(p)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Prefs>(&s).ok())
+}
+
 fn load_prefs() -> Prefs {
+    // Binary folder first; fall back to legacy config-dir file (pre-move).
     if let Some(p) = prefs_path() {
-        if let Ok(s) = std::fs::read_to_string(&p) {
-            if let Ok(pr) = serde_json::from_str::<Prefs>(&s) {
+        if let Some(pr) = read_prefs_file(&p) {
+            return pr;
+        }
+    }
+    if let Some(legacy) = legacy_prefs_path() {
+        if Some(&legacy) != prefs_path().as_ref() {
+            if let Some(pr) = read_prefs_file(&legacy) {
                 return pr;
             }
         }
@@ -97,10 +123,6 @@ fn load_prefs() -> Prefs {
 }
 
 fn save_prefs(app: &SearchApp) {
-    let Some(path) = prefs_path() else { return };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
     let pr = Prefs {
         root: app.root.clone(),
         query: app.query.clone(),
@@ -119,8 +141,22 @@ fn save_prefs(app: &SearchApp) {
         use_gitignore: app.use_gitignore,
         sort_by: app.sort_by,
     };
-    if let Ok(s) = serde_json::to_string_pretty(&pr) {
-        let _ = std::fs::write(&path, s);
+    let Ok(s) = serde_json::to_string_pretty(&pr) else {
+        return;
+    };
+    // Binary folder first; fall back to legacy config dir (e.g. Program Files read-only).
+    if let Some(path) = prefs_path() {
+        if std::fs::write(&path, &s).is_ok() {
+            return;
+        }
+    }
+    if let Some(legacy) = legacy_prefs_path() {
+        if Some(&legacy) != prefs_path().as_ref() {
+            if let Some(parent) = legacy.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&legacy, &s);
+        }
     }
 }
 
@@ -155,6 +191,9 @@ struct SearchApp {
     searching: bool,
     scanned: Arc<AtomicUsize>,
     elapsed_ms: u64,
+    walk_ms: u64,
+    match_ms: u64,
+    walked: usize,
     error: String,
     selected: Option<usize>,
 
@@ -191,7 +230,7 @@ impl SearchApp {
         visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(55, 65, 81);
         cc.egui_ctx.set_visuals(visuals);
 
-        // Restore last session; fall back to find.py defaults on first run.
+        // Restore last session; built-in defaults on first run.
         let prefs = load_prefs();
         let first_run = prefs.root.trim().is_empty();
         let ext_on: HashSet<String> = prefs.ext_on.into_iter().collect();
@@ -217,7 +256,7 @@ impl SearchApp {
                 .iter()
                 .map(|e| {
                     let on = if first_run {
-                        *e == "py" // find.py default
+                        *e == "py" // default: code search
                     } else {
                         ext_on.contains(*e)
                     };
@@ -250,6 +289,9 @@ impl SearchApp {
             searching: false,
             scanned: Arc::new(AtomicUsize::new(0)),
             elapsed_ms: 0,
+            walk_ms: 0,
+            match_ms: 0,
+            walked: 0,
             error: String::new(),
             selected: None,
             rx: None,
@@ -345,6 +387,9 @@ impl SearchApp {
         self.results.clear();
         self.selected = None;
         self.elapsed_ms = 0;
+        self.walk_ms = 0;
+        self.match_ms = 0;
+        self.walked = 0;
         self.searching = true;
         save_prefs(self); // remember folder + term + filters
 
@@ -357,13 +402,19 @@ impl SearchApp {
 
         std::thread::spawn(move || {
             let t0 = Instant::now();
-            if let Err(e) = run_search_blocking(&params, &tx, &cancel, &scanned) {
-                let _ = tx.send(Msg::Error(e));
-                return;
+            match run_search_blocking(&params, &tx, cancel, &scanned) {
+                Err(e) => {
+                    let _ = tx.send(Msg::Error(e));
+                }
+                Ok(stats) => {
+                    let _ = tx.send(Msg::Done {
+                        elapsed_ms: t0.elapsed().as_millis() as u64,
+                        walk_ms: stats.walk_ms,
+                        match_ms: stats.match_ms,
+                        walked: stats.walked,
+                    });
+                }
             }
-            let _ = tx.send(Msg::Done {
-                elapsed_ms: t0.elapsed().as_millis() as u64,
-            });
         });
     }
 
@@ -379,8 +430,16 @@ impl SearchApp {
             for _ in 0..500 {
                 match rx.try_recv() {
                     Ok(Msg::Hit(h)) => self.results.push(h),
-                    Ok(Msg::Done { elapsed_ms }) => {
+                    Ok(Msg::Done {
+                        elapsed_ms,
+                        walk_ms,
+                        match_ms,
+                        walked,
+                    }) => {
                         self.elapsed_ms = elapsed_ms;
+                        self.walk_ms = walk_ms;
+                        self.match_ms = match_ms;
+                        self.walked = walked;
                         self.searching = false;
                         self.rx = None;
                         self.cancel = None;
@@ -567,6 +626,9 @@ impl SearchApp {
                     self.results.clear();
                     self.error.clear();
                     self.elapsed_ms = 0;
+                    self.walk_ms = 0;
+                    self.match_ms = 0;
+                    self.walked = 0;
                     self.scanned.store(0, Ordering::Relaxed);
                     self.selected = None;
                 }
@@ -575,7 +637,7 @@ impl SearchApp {
                 ui.label("Sort:");
                 egui::ComboBox::from_id_salt("sort")
                     .selected_text(match self.sort_by {
-                        SortBy::Modified => "modified ↑ (find.py)",
+                        SortBy::Modified => "modified ↑",
                         SortBy::Path => "path",
                         SortBy::Size => "size",
                     })
@@ -583,7 +645,7 @@ impl SearchApp {
                         ui.selectable_value(
                             &mut self.sort_by,
                             SortBy::Modified,
-                            "modified ↑ (find.py)",
+                            "modified ↑",
                         );
                         ui.selectable_value(&mut self.sort_by, SortBy::Path, "path");
                         ui.selectable_value(&mut self.sort_by, SortBy::Size, "size");
@@ -609,7 +671,7 @@ fn path_excluded(path: &Path, root: &Path, exclude_dirs: &[String]) -> bool {
     if exclude_dirs.is_empty() {
         return false;
     }
-    // Mirror find.py substring check on full path ("node_module" in filepath).
+    // Substring check on the path under root ("node_module" in path).
     let s = path.to_string_lossy();
     // Only test the part under root to avoid drive-letter false positives.
     let rel = path
@@ -637,12 +699,25 @@ fn ext_allowed(path: &Path, exts: &HashSet<String>) -> bool {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct WalkStats {
+    walk_ms: u64,
+    match_ms: u64,
+    walked: usize,
+}
+
 fn run_search_blocking(
     params: &SearchParams,
     tx: &Sender<Msg>,
-    cancel: &AtomicBool,
+    cancel: Arc<AtomicBool>,
     scanned: &AtomicUsize,
-) -> Result<(), String> {
+) -> Result<WalkStats, String> {
+    let t_walk = Instant::now();
+
+    // Prune excluded subtrees at walk time: never descend into them.
+    // (Old code visited every file inside node_modules/.venv and skipped one by one.)
+    let ex_root = params.root.clone();
+    let ex_dirs = params.exclude_dirs.clone();
     let mut builder = WalkBuilder::new(&params.root);
     builder
         .hidden(false)
@@ -651,56 +726,88 @@ fn run_search_blocking(
         .ignore(params.use_gitignore)
         .git_exclude(params.use_gitignore)
         .follow_links(false)
-        .require_git(false);
+        .require_git(false)
+        .filter_entry(move |e| {
+            if e.depth() == 0 {
+                return true; // never prune the explicitly picked root
+            }
+            !path_excluded(e.path(), &ex_root, &ex_dirs)
+        });
     if !params.recursive {
         builder.max_depth(Some(1));
     }
 
-    // Stage 1: fast serial walk, collect candidate files.
-    let mut candidates: Vec<PathBuf> = Vec::with_capacity(8192);
-    for entry in builder.build() {
-        if cancel.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        let p = entry.path().to_path_buf();
-        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            continue;
-        }
-        if !entry
-            .file_type()
-            .map(|t| t.is_file())
-            .unwrap_or(true)
-        {
-            continue;
-        }
-        if path_excluded(&p, &params.root, &params.exclude_dirs) {
-            continue;
-        }
-        if file_name_excluded(&p, &params.exclude_file_substr) {
-            continue;
-        }
-        if !ext_allowed(&p, &params.exts) {
-            continue;
-        }
-        // Cheap size pre-filter.
-        if let Ok(md) = entry.metadata() {
-            if md.len() > params.max_bytes && params.max_bytes > 0 {
-                continue;
-            }
-        }
-        candidates.push(p);
+    // Stage 1: PARALLEL directory walk, collect candidate files.
+    let walked = Arc::new(AtomicUsize::new(0));
+    let (cand_tx, cand_rx) = unbounded::<PathBuf>();
+    let shared = Arc::new(params.clone());
+    {
+        let cancel_w = Arc::clone(&cancel);
+        let walked_w = Arc::clone(&walked);
+        builder.build_parallel().run(move || {
+            let tx = cand_tx.clone();
+            let params = Arc::clone(&shared);
+            let cancel = Arc::clone(&cancel_w);
+            let walked = Arc::clone(&walked_w);
+            Box::new(
+                move |entry: Result<ignore::DirEntry, ignore::Error>| {
+                    if cancel.load(Ordering::Relaxed) {
+                        return ignore::WalkState::Quit;
+                    }
+                    let entry = match entry {
+                        Ok(e) => e,
+                        Err(_) => return ignore::WalkState::Continue,
+                    };
+                    walked.fetch_add(1, Ordering::Relaxed);
+                    let ft = entry.file_type();
+                    if ft.map(|t| t.is_dir()).unwrap_or(false) {
+                        return ignore::WalkState::Continue;
+                    }
+                    if !ft.map(|t| t.is_file()).unwrap_or(true) {
+                        return ignore::WalkState::Continue;
+                    }
+                    let p = entry.path().to_path_buf();
+                    if file_name_excluded(&p, &params.exclude_file_substr) {
+                        return ignore::WalkState::Continue;
+                    }
+                    if !ext_allowed(&p, &params.exts) {
+                        return ignore::WalkState::Continue;
+                    }
+                    // Cheap size pre-filter (metadata already stat'd by walker).
+                    if params.max_bytes > 0 {
+                        if let Ok(md) = entry.metadata() {
+                            if md.len() > params.max_bytes {
+                                return ignore::WalkState::Continue;
+                            }
+                        }
+                    }
+                    let _ = tx.send(p);
+                    ignore::WalkState::Continue
+                },
+            )
+        });
+    }
+    let candidates: Vec<PathBuf> = cand_rx.iter().collect();
+    let walk_ms = t_walk.elapsed().as_millis() as u64;
+    let walked_n = walked.load(Ordering::Relaxed);
+
+    if candidates.is_empty() || cancel.load(Ordering::Relaxed) {
+        return Ok(WalkStats {
+            walk_ms,
+            match_ms: 0,
+            walked: walked_n,
+        });
     }
 
-    if candidates.is_empty() {
-        return Ok(());
-    }
-
-    // Stage 2: parallel content read + match (rayon).
+    // Stage 2: parallel content read + match (rayon), byte-level via memchr.
+    // Old code did from_utf8_lossy (full copy) + to_lowercase (full copy)
+    // + ANOTHER to_lowercase per line for the preview. Now: zero-copy
+    // memmem scan on bytes, lossy-convert only the single preview line.
+    let t_match = Instant::now();
     let query_empty = params.query.is_empty();
+    let qbytes = params.query.as_bytes().to_vec();
+    let qlower = params.query_lower.as_bytes().to_vec();
+    let ascii_mode = params.query.bytes().all(|b| b.is_ascii());
     candidates.par_iter().for_each(|p| {
         if cancel.load(Ordering::Relaxed) {
             return;
@@ -713,16 +820,19 @@ fn run_search_blocking(
             return;
         }
 
-        if query_empty {
-            let modified_unix = std::fs::metadata(p)
+        let modified = || {
+            std::fs::metadata(p)
                 .and_then(|m| m.modified())
                 .ok()
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
+                .unwrap_or(0)
+        };
+
+        if query_empty {
             let _ = tx.send(Msg::Hit(SearchHit {
                 path: p.to_string_lossy().to_string(),
-                modified_unix,
+                modified_unix: modified(),
                 size,
                 matches: 0,
                 preview: String::new(),
@@ -734,66 +844,85 @@ fn run_search_blocking(
             Ok(b) => b,
             Err(_) => return,
         };
-        // Skip likely-binary early (NUL in first 1KB) unless query itself needs it.
+        // Skip likely-binary early (NUL in first 1KB).
         if bytes.len() > 1024 && bytes[..1024].contains(&0) {
             return;
         }
-        let text = String::from_utf8_lossy(&bytes);
 
-        let (found, count, preview) = if params.case_sensitive {
-            let c = text.matches(params.query.as_str()).count();
-            if c == 0 {
-                return;
-            }
-            let pv = first_match_line(&text, &params.query, true);
-            (true, c, pv)
+        // Lowered view for case-insensitive ASCII (length-preserving, so
+        // match offsets map 1:1 back onto the original bytes).
+        let lowered: Vec<u8>;
+        let (haystack, needle) = if params.case_sensitive {
+            (&bytes[..], &qbytes[..])
+        } else if ascii_mode {
+            lowered = bytes.iter().map(|b| b.to_ascii_lowercase()).collect();
+            (&lowered[..], &qlower[..])
         } else {
+            // Rare unicode-query fallback: single lowercase pass, reused
+            // for both count and preview (no per-line re-lowercasing).
+            let text = String::from_utf8_lossy(&bytes);
             let lower = text.to_lowercase();
             let c = lower.matches(params.query_lower.as_str()).count();
             if c == 0 {
                 return;
             }
-            let pv = first_match_line_lower(&text, &params.query_lower);
-            (true, c, pv)
-        };
-        if !found {
+            let preview = match lower.find(params.query_lower.as_str()) {
+                Some(off) => {
+                    let start = lower[..off].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                    let end = lower[off..]
+                        .find('\n')
+                        .map(|i| off + i)
+                        .unwrap_or(lower.len());
+                    truncate(lower[start..end].trim(), 140)
+                }
+                None => String::new(),
+            };
+            let _ = tx.send(Msg::Hit(SearchHit {
+                path: p.to_string_lossy().to_string(),
+                modified_unix: modified(),
+                size,
+                matches: c,
+                preview,
+            }));
             return;
-        }
+        };
 
-        let modified_unix = std::fs::metadata(p)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        let mut it = memchr::memmem::find_iter(haystack, needle);
+        let first = match it.next() {
+            Some(off) => off,
+            None => return,
+        };
+        let count = 1 + it.count();
+        let preview = line_around(&bytes, first);
+
         let _ = tx.send(Msg::Hit(SearchHit {
             path: p.to_string_lossy().to_string(),
-            modified_unix,
+            modified_unix: modified(),
             size,
             matches: count,
             preview,
         }));
     });
+    let match_ms = t_match.elapsed().as_millis() as u64;
 
-    Ok(())
+    Ok(WalkStats {
+        walk_ms,
+        match_ms,
+        walked: walked_n,
+    })
 }
 
-fn first_match_line(text: &str, needle: &str, _cs: bool) -> String {
-    for line in text.lines() {
-        if line.contains(needle) {
-            return truncate(line.trim(), 140);
-        }
-    }
-    String::new()
-}
-
-fn first_match_line_lower(text: &str, needle_lower: &str) -> String {
-    for line in text.lines() {
-        if line.to_lowercase().contains(needle_lower) {
-            return truncate(line.trim(), 140);
-        }
-    }
-    String::new()
+/// Extract the (lossy) line containing byte offset `off`. Only this slice
+/// is UTF-8 converted — not the whole file.
+fn line_around(bytes: &[u8], off: usize) -> String {
+    let off = off.min(bytes.len());
+    let start = memchr::memrchr(b'\n', &bytes[..off])
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let end = memchr::memchr(b'\n', &bytes[off..])
+        .map(|i| off + i)
+        .unwrap_or(bytes.len());
+    truncate(String::from_utf8_lossy(&bytes[start..end]).trim(), 140)
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -881,7 +1010,7 @@ impl eframe::App for SearchApp {
             ui.horizontal(|ui| {
                 ui.heading("fv-search");
                 ui.label(
-                    egui::RichText::new("parallel file search — Rust port of find.py")
+                    egui::RichText::new("fast parallel content search")
                         .weak()
                         .small(),
                 );
@@ -899,10 +1028,13 @@ impl eframe::App for SearchApp {
                         } else if self.elapsed_ms > 0 || !self.results.is_empty() {
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "✓ {} scanned • {} matched • {} ms",
+                                    "✓ {} visited • {} read • {} matched • {} ms (walk {} + match {})",
+                                    self.walked,
                                     scanned,
                                     self.results.len(),
-                                    self.elapsed_ms
+                                    self.elapsed_ms,
+                                    self.walk_ms,
+                                    self.match_ms
                                 ))
                                 .color(GREEN)
                                 .small(),
@@ -959,7 +1091,10 @@ impl eframe::App for SearchApp {
                             )
                             .clicked()
                         {
-                            let _ = open::that(&hit.path);
+                            if let Err(e) = open::that(&hit.path) {
+                                self.error =
+                                    format!("Cannot open {}: {}", hit.path, e);
+                            }
                         }
                         if ui.small_button("📂 Folder").clicked() {
                             if let Some(parent) = Path::new(&hit.path).parent() {
@@ -1032,7 +1167,9 @@ impl eframe::App for SearchApp {
                             egui::Color32::from_rgb(30, 30, 34)
                         };
 
-                        let resp = egui::Frame::new()
+                        // Frame response only senses hover — add explicit
+                        // click area over the same rect so clicks always open.
+                        let frame_rect = egui::Frame::new()
                             .fill(bg)
                             .corner_radius(6)
                             .inner_margin(egui::Margin::symmetric(8, 5))
@@ -1095,7 +1232,19 @@ impl eframe::App for SearchApp {
                                     );
                                 });
                             })
-                            .response;
+                            .response
+                            .rect;
+
+                        let resp = ui
+                            .interact(
+                                frame_rect,
+                                ui.make_persistent_id(("hit", i)),
+                                egui::Sense::click(),
+                            )
+                            .on_hover_text("Click to open file");
+                        if resp.hovered() {
+                            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
 
                         // SINGLE CLICK = open file (per user request).
                         if resp.clicked() {
@@ -1126,7 +1275,9 @@ impl eframe::App for SearchApp {
                         self.selected = Some(i);
                     }
                     if let Some(p) = to_open {
-                        let _ = open::that(p);
+                        if let Err(e) = open::that(&p) {
+                            self.error = format!("Cannot open {}: {}", p, e);
+                        }
                     }
 
                     if self.results.len() > RENDER_CAP {

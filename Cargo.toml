@@ -2,7 +2,7 @@
 name = "fv-search"
 version = "0.1.0"
 edition = "2021"
-description = "Cross-platform high-performance file content search GUI (Rust port of find.py)"
+description = "Cross-platform high-performance file content search GUI"
 
 [dependencies]
 eframe = { version = "0.32", features = ["default"] }
@@ -16,6 +16,7 @@ chrono = { version = "0.4", features = ["clock"] }
 dirs = "5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+memchr = "2"
 
 [profile.release]
 opt-level = 3
